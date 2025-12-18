@@ -6,8 +6,7 @@ import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, Optional, List
 
 
-def detect_encoding_bom(path: Path) -> str:
-    raw = path.read_bytes()
+def detect_encoding_bom(raw: bytes) -> str:
     if raw.startswith(b"\xff\xfe"):
         return "utf-16le"
     if raw.startswith(b"\xfe\xff"):
@@ -18,8 +17,9 @@ def detect_encoding_bom(path: Path) -> str:
 
 
 def read_text_auto(path: Path) -> Tuple[str, str]:
-    enc = detect_encoding_bom(path)
-    return path.read_text(encoding=enc), enc
+    raw = path.read_bytes()
+    enc = detect_encoding_bom(raw)
+    return raw.decode(enc), enc
 
 
 def parse_xml(path: Path) -> ET.ElementTree:
@@ -75,6 +75,12 @@ def build_map_by_key(root: ET.Element) -> Dict[str, ET.Element]:
 def clone_root_without_children(src_root: ET.Element) -> ET.Element:
     new_root = ET.Element(src_root.tag, attrib=dict(src_root.attrib))
     return new_root
+
+
+def ensure_parent_dir(path: Path) -> None:
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
 
 
 def write_xml(path: Path, root: ET.Element, encoding: str):
@@ -184,6 +190,9 @@ def main():
         "changed_keys_left_in_english": changed,
         "keys_removed_from_new_version": missing_in_new
     }
+
+    ensure_parent_dir(out_path)
+    ensure_parent_dir(report_path)
 
     write_xml(out_path, out_root, args.out_encoding)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
