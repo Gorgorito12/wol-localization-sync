@@ -17,16 +17,21 @@ def detect_encoding_bom(raw: bytes) -> str:
     return "utf-8"
 
 
-def read_text_auto(path: Path) -> Tuple[str, str]:
+def has_xml_declaration(text: str) -> bool:
+    return text.lstrip().startswith("<?xml")
+
+
+def read_text_auto(path: Path) -> Tuple[str, str, bool]:
     raw = path.read_bytes()
     enc = detect_encoding_bom(raw)
-    return raw.decode(enc), enc
+    text = raw.decode(enc)
+    return text, enc, has_xml_declaration(text)
 
 
-def parse_xml(path: Path) -> ET.ElementTree:
-    text, _ = read_text_auto(path)
+def parse_xml(path: Path) -> TypingTuple[ET.ElementTree, str, bool]:
+    text, enc, has_decl = read_text_auto(path)
     # ElementTree parse from string to keep auto-decoding simple
-    return ET.ElementTree(ET.fromstring(text))
+    return ET.ElementTree(ET.fromstring(text)), enc, has_decl
 
 
 def local_name(tag: str) -> str:
@@ -87,10 +92,10 @@ def ensure_parent_dir(path: Path) -> None:
         parent.mkdir(parents=True, exist_ok=True)
 
 
-def write_xml(path: Path, root: ET.Element, encoding: str):
+def write_xml(path: Path, root: ET.Element, encoding: str, include_declaration: bool):
     tree = ET.ElementTree(root)
     # ElementTree will include XML declaration when xml_declaration=True
-    tree.write(path, encoding=encoding, xml_declaration=True)
+    tree.write(path, encoding=encoding, xml_declaration=include_declaration)
 
 
 def main():
@@ -126,9 +131,9 @@ def main():
             "Order matters; the first matching attribute wins. Defaults to symbol, _locID, id, name, key."
         ),
     )
-    p.add_argument("--out-encoding", default="utf-8",
-                   choices=["utf-8", "utf-8-sig", "utf-16le", "utf-16be"],
-                   help="Encoding for output XML (default utf-8).")
+    p.add_argument("--out-encoding", default="auto",
+                   choices=["auto", "utf-8", "utf-8-sig", "utf-16le", "utf-16be"],
+                   help="Encoding for output XML (default: original translation encoding).")
     args = p.parse_args()
 
     key_attrs = args.key_attr or ["symbol", "_locID", "id", "name", "key"]
@@ -139,8 +144,8 @@ def main():
     out_path = Path(args.out)
     report_path = Path(args.report)
 
-    new_en_tree = parse_xml(new_en_path)
-    old_tr_tree = parse_xml(old_tr_path)
+    new_en_tree, _, _ = parse_xml(new_en_path)
+    old_tr_tree, old_tr_encoding, old_tr_has_decl = parse_xml(old_tr_path)
 
     new_root = new_en_tree.getroot()
     old_tr_root = old_tr_tree.getroot()
@@ -150,7 +155,7 @@ def main():
 
     old_en_map = None
     if old_en_path:
-        old_en_tree = parse_xml(old_en_path)
+        old_en_tree, _, _ = parse_xml(old_en_path)
         old_en_map = build_map_by_key(old_en_tree.getroot(), args.match_tag, key_attrs)
 
     changed = []
@@ -227,7 +232,8 @@ def main():
     ensure_parent_dir(out_path)
     ensure_parent_dir(report_path)
 
-    write_xml(out_path, new_root, args.out_encoding)
+    out_encoding = old_tr_encoding if args.out_encoding == "auto" else args.out_encoding
+    write_xml(out_path, new_root, out_encoding, include_declaration=old_tr_has_decl)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("Done!")
