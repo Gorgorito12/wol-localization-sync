@@ -13,6 +13,7 @@ import argparse
 import codecs
 import json
 import logging
+import bisect
 import re
 import sys
 from pathlib import Path
@@ -20,6 +21,9 @@ from typing import Dict, Iterable, List, Tuple
 
 
 StringMatch = Tuple[int, int, int, int, str]
+CommentSpan = Tuple[int, int]
+
+COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 def detect_encoding_and_text(path: Path) -> Tuple[str, bytes, str]:
@@ -61,13 +65,29 @@ def extract_locid(attributes: str) -> str | None:
     return None
 
 
+def find_comment_spans(xml_text: str) -> List[CommentSpan]:
+    return [(m.start(), m.end()) for m in COMMENT_PATTERN.finditer(xml_text)]
+
+
+def is_within_comment_spans(index: int, spans: List[CommentSpan]) -> bool:
+    starts = [span[0] for span in spans]
+    pos = bisect.bisect_right(starts, index) - 1
+    if pos < 0:
+        return False
+    start, end = spans[pos]
+    return start <= index < end
+
+
 def parse_stringtable_mapping(xml_text: str) -> Dict[str, str]:
     """Extract a mapping of _locID to raw inner text from a StringTable XML."""
 
     mapping: Dict[str, str] = {}
     string_pattern = re.compile(r"<String\b([^>]*)>(.*?)</String>", re.DOTALL | re.IGNORECASE)
+    comment_spans = find_comment_spans(xml_text)
 
     for match in string_pattern.finditer(xml_text):
+        if is_within_comment_spans(match.start(), comment_spans):
+            continue
         attrs = match.group(1)
         locid = extract_locid(attrs)
         if not locid:
@@ -85,8 +105,11 @@ def find_string_elements(xml_text: str) -> Iterable[StringMatch]:
     """
 
     string_pattern = re.compile(r"<String\b([^>]*)>(.*?)</String>", re.DOTALL | re.IGNORECASE)
+    comment_spans = find_comment_spans(xml_text)
 
     for match in string_pattern.finditer(xml_text):
+        if is_within_comment_spans(match.start(), comment_spans):
+            continue
         attrs = match.group(1)
         locid = extract_locid(attrs)
         if locid is None:
