@@ -227,11 +227,12 @@ def main(argv: List[str] | None = None) -> int:
     merged_text, matched, missing = replace_strings(new_text, translations)
 
     errors = validate_output(new_text, merged_text)
+    exit_code = 0
     if errors:
         for err in errors:
             logging.error(err)
         if args.strict:
-            return 1
+            exit_code = 1
     else:
         logging.info("Validaciones completadas sin errores")
 
@@ -247,7 +248,7 @@ def main(argv: List[str] | None = None) -> int:
     logging.info("Reporte escrito en %s", report_path)
 
     logging.info("Strings actualizados: %s | Strings sin traducción: %s", matched, missing)
-    return 0 if not errors else (1 if args.strict else 0)
+    return exit_code
 
 
 if __name__ == "__main__":
