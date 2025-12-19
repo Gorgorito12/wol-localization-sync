@@ -188,7 +188,7 @@ def rewrite_xml_preserving_layout(
     """
 
     parser = expat.ParserCreate()
-    parser.buffer_text = True
+    parser.buffer_text = False
     out_chunks: List[bytes] = []
 
     # Tracking for building paths in the same way as iter_elements_with_paths
@@ -196,15 +196,35 @@ def rewrite_xml_preserving_layout(
     element_stack: List[Dict[str, object]] = []
 
     last_index = 0
+    pending_char: Optional[Dict[str, object]] = None
     match_lower = match_tag.lower() if match_tag else None
     replace_encoding = encoding_without_bom(encoding)
     prepared_replacements = {
         path: escape_xml_text(text).encode(replace_encoding) for path, text in replacements.items()
     }
 
+    def flush_pending(end_index: int):
+        nonlocal last_index, pending_char
+        if pending_char is None:
+            return
+
+        start_index = pending_char["start_index"]  # type: ignore[index]
+        replacement: Optional[bytes] = pending_char["replacement"]  # type: ignore[index]
+
+        out_chunks.append(raw_bytes[last_index:start_index])
+
+        if replacement is not None:
+            out_chunks.append(replacement)
+        else:
+            out_chunks.append(raw_bytes[start_index:end_index])
+
+        last_index = end_index
+        pending_char = None
+
     def start_element(name: str, attrs: Dict[str, str]):
         nonlocal last_index
         current_index = parser.CurrentByteIndex
+        flush_pending(current_index)
         out_chunks.append(raw_bytes[last_index:current_index])
 
         local = local_name(name)
@@ -232,32 +252,39 @@ def rewrite_xml_preserving_layout(
     def end_element(name: str):
         nonlocal last_index
         current_index = parser.CurrentByteIndex
+        flush_pending(current_index)
         out_chunks.append(raw_bytes[last_index:current_index])
         last_index = current_index
         element_stack.pop()
         child_count_stack.pop()
 
     def char_data(data: str):
-        nonlocal last_index
+        nonlocal last_index, pending_char
+        current_index = parser.CurrentByteIndex
+        flush_pending(current_index)
+
         if not element_stack:
             return
-        current_index = parser.CurrentByteIndex
-        text_bytes = data.encode(replace_encoding)
-        text_start = current_index - len(text_bytes)
+
         path = element_stack[-1]["path"]
+        replacement: Optional[bytes] = None
 
-        # Copy bytes up to the start of this text node (e.g., the opening tag).
-        out_chunks.append(raw_bytes[last_index:text_start])
+        if (
+            element_stack[-1]["is_match"]
+            and path in prepared_replacements
+            and not element_stack[-1]["text_replaced"]
+        ):
+            replacement = prepared_replacements[path]
+            element_stack[-1]["text_replaced"] = True
+        elif element_stack[-1]["text_replaced"]:
+            # We've already replaced earlier character data for this element;
+            # skip subsequent raw text chunks to avoid duplicating content.
+            replacement = b""
 
-        if element_stack[-1]["is_match"] and path in prepared_replacements:
-            if not element_stack[-1]["text_replaced"]:
-                out_chunks.append(prepared_replacements[path])
-                element_stack[-1]["text_replaced"] = True
-            # Skip the original text bytes entirely when replacing.
-        else:
-            out_chunks.append(text_bytes)
-
-        last_index = current_index
+        pending_char = {
+            "start_index": current_index,
+            "replacement": replacement,
+        }
 
     parser.StartElementHandler = start_element
     parser.EndElementHandler = end_element
@@ -268,6 +295,7 @@ def rewrite_xml_preserving_layout(
     except expat.ExpatError as exc:
         raise ValueError(f"Failed to stream-rewrite XML: {exc}") from exc
 
+    flush_pending(len(raw_bytes))
     out_chunks.append(raw_bytes[last_index:])
     return b"".join(out_chunks)
 
