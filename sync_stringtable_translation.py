@@ -156,7 +156,7 @@ def main():
     )
     p.add_argument("--out-encoding", default="auto",
                    choices=["auto", "utf-8", "utf-8-sig", "utf-16le", "utf-16be"],
-                   help="Encoding for output XML (default: original translation encoding).")
+                   help="Encoding for output XML (default: match the new source XML encoding).")
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     verbosity.add_argument("--quiet", action="store_true", help="Reduce logging to warnings only.")
@@ -190,8 +190,8 @@ def main():
         logger.error("Failed to prepare output directories: %s", exc)
         sys.exit(1)
 
-    new_en_tree, _, _ = parse_xml(new_en_path)
-    old_tr_tree, old_tr_encoding, old_tr_has_decl = parse_xml(old_tr_path)
+    new_en_tree, new_en_encoding, new_en_has_decl = parse_xml(new_en_path)
+    old_tr_tree, _, _ = parse_xml(old_tr_path)
 
     new_root = new_en_tree.getroot()
     old_tr_root = old_tr_tree.getroot()
@@ -299,9 +299,11 @@ def main():
     ensure_parent_dir(out_path)
     ensure_parent_dir(report_path)
 
-    out_encoding = old_tr_encoding if args.out_encoding == "auto" else args.out_encoding
+    out_encoding = (
+        new_en_encoding if args.out_encoding == "auto" else args.out_encoding
+    )
     try:
-        write_xml(out_path, new_root, out_encoding, include_declaration=old_tr_has_decl)
+        write_xml(out_path, new_root, out_encoding, include_declaration=new_en_has_decl)
     except OSError as exc:
         logger.error("Failed to write output XML %s: %s", out_path, exc)
         sys.exit(1)
