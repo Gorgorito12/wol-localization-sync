@@ -1,6 +1,8 @@
 import argparse
 import json
+import logging
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -76,14 +78,35 @@ def iter_elements_with_paths(root: ET.Element, match_tag: Optional[str]) -> Iter
     yield from walk(root, root_path)
 
 
-def build_map_by_key(root: ET.Element, match_tag: Optional[str], key_attrs: List[str]) -> Dict[str, Dict[str, object]]:
+def build_map_by_key(
+    root: ET.Element, match_tag: Optional[str], key_attrs: List[str]
+) -> TypingTuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
     m: Dict[str, Dict[str, object]] = {}
+    duplicates: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+
     for path, e in iter_elements_with_paths(root, match_tag):
         k = key_for_element(e, path, key_attrs)
-        # keep first occurrence if duplicates
+        entry = {"path": path, "line": getattr(e, "sourceline", None)}
+
         if k not in m:
             m[k] = {"element": e, "path": path}
-    return m
+        else:
+            if not duplicates[k]:
+                first = m[k]
+                duplicates[k].append(
+                    {"path": first["path"], "line": getattr(first["element"], "sourceline", None)}
+                )
+            duplicates[k].append(entry)
+
+    duplicate_list = [
+        {
+            "key": key,
+            "occurrences": occurrences,
+        }
+        for key, occurrences in duplicates.items()
+    ]
+
+    return m, duplicate_list
 
 
 def ensure_parent_dir(path: Path) -> None:
@@ -134,9 +157,20 @@ def main():
     p.add_argument("--out-encoding", default="auto",
                    choices=["auto", "utf-8", "utf-8-sig", "utf-16le", "utf-16be"],
                    help="Encoding for output XML (default: original translation encoding).")
+    verbosity = p.add_mutually_exclusive_group()
+    verbosity.add_argument("--verbose", action="store_true", help="Enable debug logging.")
+    verbosity.add_argument("--quiet", action="store_true", help="Reduce logging to warnings only.")
     args = p.parse_args()
 
+    log_level = logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
+    logger = logging.getLogger(__name__)
+
     key_attrs = args.key_attr or ["symbol", "_locID", "id", "name", "key"]
+
+    def validate_input_file(path: Path, label: str):
+        if not path.exists() or not path.is_file():
+            p.error(f"{label} does not exist or is not a file: {path}")
 
     new_en_path = Path(args.new_en)
     old_tr_path = Path(args.old_trans)
@@ -144,19 +178,40 @@ def main():
     out_path = Path(args.out)
     report_path = Path(args.report)
 
+    validate_input_file(new_en_path, "--new-en")
+    validate_input_file(old_tr_path, "--old-trans")
+    if old_en_path:
+        validate_input_file(old_en_path, "--old-en")
+
+    try:
+        ensure_parent_dir(out_path)
+        ensure_parent_dir(report_path)
+    except OSError as exc:
+        logger.error("Failed to prepare output directories: %s", exc)
+        sys.exit(1)
+
     new_en_tree, _, _ = parse_xml(new_en_path)
     old_tr_tree, old_tr_encoding, old_tr_has_decl = parse_xml(old_tr_path)
 
     new_root = new_en_tree.getroot()
     old_tr_root = old_tr_tree.getroot()
 
-    new_map = build_map_by_key(new_root, args.match_tag, key_attrs)
-    old_tr_map = build_map_by_key(old_tr_root, args.match_tag, key_attrs)
+    new_map, new_duplicates = build_map_by_key(new_root, args.match_tag, key_attrs)
+    old_tr_map, old_tr_duplicates = build_map_by_key(old_tr_root, args.match_tag, key_attrs)
 
     old_en_map = None
+    old_en_duplicates: List[Dict[str, object]] = []
     if old_en_path:
         old_en_tree, _, _ = parse_xml(old_en_path)
-        old_en_map = build_map_by_key(old_en_tree.getroot(), args.match_tag, key_attrs)
+        old_en_map, old_en_duplicates = build_map_by_key(old_en_tree.getroot(), args.match_tag, key_attrs)
+
+    for label, dup_list in (
+        ("new source", new_duplicates),
+        ("old translation", old_tr_duplicates),
+        ("old source", old_en_duplicates if old_en_path else []),
+    ):
+        if dup_list:
+            logger.warning("Detected %d duplicate key(s) in %s XML", len(dup_list), label)
 
     changed = []
     added = []
@@ -223,23 +278,44 @@ def main():
             "old_en_provided": bool(old_en_map),
             "match_tag": args.match_tag,
             "key_attrs": key_attrs,
+            "percent_changed": (len(changed) / len(new_strings) * 100) if new_strings else 0,
+            "percent_added": (len(added) / len(new_strings) * 100) if new_strings else 0,
+            "duplicate_keys_new": len(new_duplicates),
+            "duplicate_keys_old_translation": len(old_tr_duplicates),
+            "duplicate_keys_old_source": len(old_en_duplicates) if old_en_path else 0,
         },
         "added_new_keys_left_in_english": added,
         "changed_keys_left_in_english": changed,
-        "keys_removed_from_new_version": missing_in_new
+        "keys_removed_from_new_version": missing_in_new,
+        "diagnostics": {
+            "duplicate_keys": {
+                "new_source": new_duplicates,
+                "old_translation": old_tr_duplicates,
+                "old_source": old_en_duplicates,
+            }
+        },
     }
 
     ensure_parent_dir(out_path)
     ensure_parent_dir(report_path)
 
     out_encoding = old_tr_encoding if args.out_encoding == "auto" else args.out_encoding
-    write_xml(out_path, new_root, out_encoding, include_declaration=old_tr_has_decl)
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        write_xml(out_path, new_root, out_encoding, include_declaration=old_tr_has_decl)
+    except OSError as exc:
+        logger.error("Failed to write output XML %s: %s", out_path, exc)
+        sys.exit(1)
 
-    print("Done!")
-    print(f"Output XML: {out_path}")
-    print(f"Report JSON: {report_path}")
-    print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+    try:
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Failed to write report JSON %s: %s", report_path, exc)
+        sys.exit(1)
+
+    logger.info("Done!")
+    logger.info("Output XML: %s", out_path)
+    logger.info("Report JSON: %s", report_path)
+    logger.info(json.dumps(report["summary"], ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
