@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, Optional, List, Iterable, Tuple as TypingTuple
+from xml.parsers import expat
 
 
 def detect_encoding_bom(raw: bytes) -> str:
@@ -121,6 +122,104 @@ def write_xml(path: Path, root: ET.Element, encoding: str, include_declaration: 
     tree.write(path, encoding=encoding, xml_declaration=include_declaration)
 
 
+def encoding_without_bom(enc: str) -> str:
+    return "utf-8" if enc.lower() == "utf-8-sig" else enc
+
+
+def key_for_attributes(attrs: Dict[str, str], path: str, key_attrs: List[str]) -> str:
+    for attr in key_attrs:
+        if attr in attrs:
+            return f"{attr}:{attrs[attr]}"
+    return f"path:{path}"
+
+
+def rewrite_xml_preserving_layout(
+    raw_bytes: bytes,
+    replacements: Dict[str, str],
+    encoding: str,
+    key_attrs: List[str],
+    match_tag: Optional[str],
+) -> bytes:
+    """
+    Stream through the original XML bytes and replace only the text content for
+    elements whose path matches replacements. All other bytes are copied verbatim,
+    so formatting, attribute order, comments, and whitespace are preserved.
+    """
+
+    parser = expat.ParserCreate()
+    parser.buffer_text = True
+    out_chunks: List[bytes] = []
+
+    # Tracking for building paths in the same way as iter_elements_with_paths
+    child_count_stack: List[Dict[str, int]] = []
+    element_stack: List[Dict[str, object]] = []
+
+    last_index = 0
+    match_lower = match_tag.lower() if match_tag else None
+    replace_encoding = encoding_without_bom(encoding)
+
+    def start_element(name: str, attrs: Dict[str, str]):
+        nonlocal last_index
+        current_index = parser.CurrentByteIndex
+        out_chunks.append(raw_bytes[last_index:current_index])
+
+        local = local_name(name)
+        if element_stack:
+            sibling_counts = child_count_stack[-1]
+            sibling_counts[local] = sibling_counts.get(local, 0) + 1
+            idx = sibling_counts[local]
+            parent_path = element_stack[-1]["path"]
+            path = f"{parent_path}/{local}[{idx}]"
+        else:
+            path = f"/{local}[1]"
+
+        child_count_stack.append({})
+        element_stack.append(
+            {
+                "path": path,
+                "key": key_for_attributes(attrs, path, key_attrs),
+                "local": local,
+                "is_match": match_lower is None or local.lower() == match_lower,
+            }
+        )
+        last_index = current_index
+
+    def end_element(name: str):
+        nonlocal last_index
+        current_index = parser.CurrentByteIndex
+        out_chunks.append(raw_bytes[last_index:current_index])
+        last_index = current_index
+        element_stack.pop()
+        child_count_stack.pop()
+
+    def char_data(data: str):
+        nonlocal last_index
+        if not element_stack:
+            return
+        current_index = parser.CurrentByteIndex
+        path = element_stack[-1]["path"]
+        chunk = raw_bytes[last_index:current_index]
+
+        if element_stack[-1]["is_match"] and path in replacements:
+            out_chunks.append(replacements[path].encode(replace_encoding))
+        else:
+            out_chunks.append(chunk)
+
+        last_index = current_index
+
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
+    parser.CharacterDataHandler = char_data
+
+    try:
+        parser.Parse(raw_bytes, True)
+    except expat.ExpatError as exc:
+        raise ValueError(f"Failed to stream-rewrite XML: {exc}") from exc
+
+    out_chunks.append(raw_bytes[last_index:])
+    return b"".join(out_chunks)
+
+
 def main():
     p = argparse.ArgumentParser(
         description=(
@@ -190,7 +289,7 @@ def main():
         logger.error("Failed to prepare output directories: %s", exc)
         sys.exit(1)
 
-    new_en_tree, new_en_encoding, new_en_has_decl = parse_xml(new_en_path)
+    new_en_tree, new_en_encoding, _ = parse_xml(new_en_path)
     old_tr_tree, _, _ = parse_xml(old_tr_path)
 
     new_root = new_en_tree.getroot()
@@ -228,6 +327,7 @@ def main():
 
     # Update elements in-place on NEW_EN tree (keeps structure intact)
     new_strings = list(iter_elements_with_paths(new_root, args.match_tag))
+    original_text_by_path = {path: elem.text or "" for path, elem in new_strings}
     for path_new, e_new in new_strings:
         k = key_for_element(e_new, path_new, key_attrs)
         new_text = e_new.text or ""
@@ -268,6 +368,12 @@ def main():
                 "new_en": new_text
             })
 
+    replacements: Dict[str, str] = {}
+    for path, elem in new_strings:
+        final_text = elem.text or ""
+        if final_text != original_text_by_path.get(path, ""):
+            replacements[path] = final_text
+
     report = {
         "summary": {
             "total_new_strings": len(new_strings),
@@ -299,11 +405,33 @@ def main():
     ensure_parent_dir(out_path)
     ensure_parent_dir(report_path)
 
-    out_encoding = (
-        new_en_encoding if args.out_encoding == "auto" else args.out_encoding
-    )
+    out_encoding = new_en_encoding if args.out_encoding == "auto" else args.out_encoding
+    raw_new_bytes = new_en_path.read_bytes()
     try:
-        write_xml(out_path, new_root, out_encoding, include_declaration=new_en_has_decl)
+        rewritten_bytes = rewrite_xml_preserving_layout(
+            raw_new_bytes,
+            replacements,
+            new_en_encoding,
+            key_attrs,
+            args.match_tag,
+        )
+    except ValueError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
+    if out_encoding != new_en_encoding:
+        try:
+            rewritten_text = rewritten_bytes.decode(encoding_without_bom(new_en_encoding))
+        except UnicodeDecodeError as exc:
+            logger.error("Failed to decode rewritten XML using source encoding %s: %s", new_en_encoding, exc)
+            sys.exit(1)
+
+        decl_pattern = re.compile(r'(<\?xml[^>]*encoding=["\'])([^"\']+)(["\'])', re.IGNORECASE)
+        rewritten_text = decl_pattern.sub(rf"\1{out_encoding}\3", rewritten_text, count=1)
+        rewritten_bytes = rewritten_text.encode(out_encoding)
+
+    try:
+        out_path.write_bytes(rewritten_bytes)
     except OSError as exc:
         logger.error("Failed to write output XML %s: %s", out_path, exc)
         sys.exit(1)
