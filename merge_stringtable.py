@@ -169,6 +169,8 @@ def validate_output(new_text: str, merged_text: str) -> List[str]:
 
 
 def write_output(path: Path, text: str, encoding: str, bom: bytes) -> None:
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
     payload = text.encode(encoding)
     if bom:
         payload = bom + payload
@@ -178,6 +180,8 @@ def write_output(path: Path, text: str, encoding: str, bom: bytes) -> None:
 def build_report(
     total_new: int, total_old: int, matched: int, missing: int, report_path: Path
 ) -> None:
+    if report_path.parent and not report_path.parent.exists():
+        report_path.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "total_new_strings": total_new,
         "total_old_translated_strings": total_old,
