@@ -24,7 +24,9 @@ from xml.etree import ElementTree as ET
 
 
 STRING_PATTERN = re.compile(
-    r'<String\b[^>]*\s_locID\s*=\s*"([^"]+)"[^>]*>(.*?)</String>',
+    r'<(?P<prefix>[A-Za-z_][\w\.\-]*:)?String\b[^>]*\s_locID\s*=\s*(?P<quote>["\'])'
+    r'(?P<loc_id>[^"\']+)(?P=quote)[^>]*>'
+    r'(?P<inner>.*?)</(?P=prefix)?String>',
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -123,16 +125,16 @@ def escape_xml_text(text: str) -> str:
 def collect_template_strings(template: str) -> List[TemplateString]:
     strings: List[TemplateString] = []
     for match in STRING_PATTERN.finditer(template):
-        loc_id = match.group(1)
-        inner_text = match.group(2)
+        loc_id = match.group("loc_id")
+        inner_text = match.group("inner")
         strings.append(
             TemplateString(
                 loc_id=loc_id,
                 inner_text=inner_text,
                 start=match.start(),
                 end=match.end(),
-                inner_start=match.start(2),
-                inner_end=match.end(2),
+                inner_start=match.start("inner"),
+                inner_end=match.end("inner"),
             )
         )
     return strings
