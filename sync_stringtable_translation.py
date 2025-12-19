@@ -8,6 +8,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, Optional, List, Iterable, Tuple as TypingTuple
 from xml.parsers import expat
+from xml.sax.saxutils import escape
 
 
 def detect_encoding_bom(raw: bytes) -> str:
@@ -57,6 +58,12 @@ def normalize_text(s: Optional[str]) -> str:
         return ""
     # collapse runs of whitespace except keep literal backslash sequences intact
     return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def escape_xml_text(text: str) -> str:
+    """Escape text for XML character data without touching existing layout."""
+
+    return escape(text, entities={"'": "&apos;", '"': "&quot;"})
 
 
 def iter_elements_with_paths(root: ET.Element, match_tag: Optional[str]) -> Iterable[TypingTuple[str, ET.Element]]:
@@ -157,6 +164,9 @@ def rewrite_xml_preserving_layout(
     last_index = 0
     match_lower = match_tag.lower() if match_tag else None
     replace_encoding = encoding_without_bom(encoding)
+    prepared_replacements = {
+        path: escape_xml_text(text).encode(replace_encoding) for path, text in replacements.items()
+    }
 
     def start_element(name: str, attrs: Dict[str, str]):
         nonlocal last_index
@@ -180,6 +190,7 @@ def rewrite_xml_preserving_layout(
                 "key": key_for_attributes(attrs, path, key_attrs),
                 "local": local,
                 "is_match": match_lower is None or local.lower() == match_lower,
+                "text_replaced": False,
             }
         )
         last_index = current_index
@@ -200,8 +211,10 @@ def rewrite_xml_preserving_layout(
         path = element_stack[-1]["path"]
         chunk = raw_bytes[last_index:current_index]
 
-        if element_stack[-1]["is_match"] and path in replacements:
-            out_chunks.append(replacements[path].encode(replace_encoding))
+        if element_stack[-1]["is_match"] and path in prepared_replacements:
+            if not element_stack[-1]["text_replaced"]:
+                out_chunks.append(prepared_replacements[path])
+                element_stack[-1]["text_replaced"] = True
         else:
             out_chunks.append(chunk)
 
