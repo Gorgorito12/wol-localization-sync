@@ -45,24 +45,57 @@ class MergeResult:
     report: dict
 
 
-def detect_encoding(text: str) -> str:
+def detect_encoding(text: str, default: str = "utf-8") -> str:
     declaration = re.search(r'<\?xml[^>]*encoding=["\']([^"\']+)["\']', text, re.IGNORECASE)
     if declaration:
         return declaration.group(1)
-    return "utf-8"
+    return default
 
 
-def read_text_with_bom(path: Path) -> Tuple[str, bool]:
+def read_text_with_bom(path: Path) -> Tuple[str, bool, str]:
     raw = path.read_bytes()
-    has_bom = raw.startswith(b"\xef\xbb\xbf")
-    text = raw.decode("utf-8-sig") if has_bom else raw.decode("utf-8")
-    return text, has_bom
+
+    bom_encodings: List[Tuple[bytes, str, str]] = [
+        (b"\xef\xbb\xbf", "utf-8-sig", "utf-8"),
+        (b"\xff\xfe\x00\x00", "utf-32", "utf-32-le"),
+        (b"\x00\x00\xfe\xff", "utf-32", "utf-32-be"),
+        (b"\xff\xfe", "utf-16", "utf-16-le"),
+        (b"\xfe\xff", "utf-16", "utf-16-be"),
+    ]
+
+    has_bom = False
+    decode_encoding = "utf-8"
+    write_encoding = "utf-8"
+
+    for bom, dec_enc, wr_enc in bom_encodings:
+        if raw.startswith(bom):
+            has_bom = True
+            decode_encoding = dec_enc
+            write_encoding = wr_enc
+            break
+
+    text = raw.decode(decode_encoding)
+    return text, has_bom, write_encoding
 
 
 def write_text_with_bom(path: Path, text: str, encoding: str, has_bom: bool) -> None:
+    normalized = encoding.lower().replace("-", "")
     data = text.encode(encoding)
-    if has_bom and encoding.lower().replace("-", "") == "utf8":
-        data = b"\xef\xbb\xbf" + data
+
+    if has_bom:
+        bom_map = {
+            "utf8": b"\xef\xbb\xbf",
+            "utf16": b"\xff\xfe",
+            "utf16le": b"\xff\xfe",
+            "utf16be": b"\xfe\xff",
+            "utf32": b"\xff\xfe\x00\x00",
+            "utf32le": b"\xff\xfe\x00\x00",
+            "utf32be": b"\x00\x00\xfe\xff",
+        }
+        bom = bom_map.get(normalized)
+        if bom and not data.startswith(bom):
+            data = bom + data
+
     path.write_bytes(data)
 
 
@@ -257,8 +290,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     report_path = Path(args.report)
     old_en_path = Path(args.old_en) if args.old_en else None
 
-    template_text, has_bom = read_text_with_bom(new_path)
-    encoding = detect_encoding(template_text)
+    template_text, has_bom, read_encoding = read_text_with_bom(new_path)
+    encoding = detect_encoding(template_text, default=read_encoding)
 
     try:
         new_en_map = parse_string_map(template_text)
@@ -267,7 +300,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         return 1
 
     try:
-        old_trans_text, _ = read_text_with_bom(old_trans_path)
+        old_trans_text, _, _ = read_text_with_bom(old_trans_path)
         old_trans_map = parse_string_map(old_trans_text)
     except (FileNotFoundError, ValueError) as exc:
         print(f"[error] Failed to load old translated XML: {exc}", file=sys.stderr)
@@ -276,7 +309,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     old_en_map = None
     if old_en_path:
         try:
-            old_en_text, _ = read_text_with_bom(old_en_path)
+            old_en_text, _, _ = read_text_with_bom(old_en_path)
             old_en_map = parse_string_map(old_en_text)
         except (FileNotFoundError, ValueError) as exc:
             print(f"[error] Failed to load old English XML: {exc}", file=sys.stderr)
