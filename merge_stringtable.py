@@ -26,6 +26,46 @@ CommentSpan = Tuple[int, int]
 COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
+def compute_line_col(text: str, index: int) -> Tuple[int, int]:
+    line = text.count("\n", 0, index) + 1
+    last_nl = text.rfind("\n", 0, index)
+    col = index + 1 if last_nl == -1 else index - last_nl
+    return line, col
+
+
+def scan_malformed_comments(label: str, xml_text: str) -> List[str]:
+    errors: List[str] = []
+
+    for match in re.finditer(r"<!\s+--", xml_text):
+        line, col = compute_line_col(xml_text, match.start())
+        errors.append(
+            f"{label}: malformed comment start '<! --' at line {line}, column {col}"
+        )
+
+    for match in re.finditer(r"--\s+>", xml_text):
+        line, col = compute_line_col(xml_text, match.start())
+        errors.append(f"{label}: malformed comment end '-- >' at line {line}, column {col}")
+
+    start_stack: List[int] = []
+    for start in re.finditer(r"<!--", xml_text):
+        start_stack.append(start.start())
+    for end in re.finditer(r"-->", xml_text):
+        if start_stack:
+            start_stack.pop()
+        else:
+            line, col = compute_line_col(xml_text, end.start())
+            errors.append(
+                f"{label}: unexpected comment terminator '-->' at line {line}, column {col}"
+            )
+    for start_index in start_stack:
+        line, col = compute_line_col(xml_text, start_index)
+        errors.append(
+            f"{label}: unterminated comment starting at line {line}, column {col}"
+        )
+
+    return errors
+
+
 def detect_encoding_and_text(path: Path) -> Tuple[str, bytes, str]:
     """Read a file preserving BOM and return encoding, bom bytes, and text.
 
@@ -129,6 +169,18 @@ def merge_content(original: str, translation: str) -> str:
     return translation
 
 
+def escape_translation_text(text: str) -> str:
+    """Escape unsafe characters while preserving valid entities."""
+
+    text = re.sub(
+        r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);)",
+        "&amp;",
+        text,
+    )
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    return text
+
+
 def replace_strings(new_text: str, translations: Dict[str, str]) -> Tuple[str, int, int]:
     """Replace String inner text in the new template with translations."""
 
@@ -141,7 +193,8 @@ def replace_strings(new_text: str, translations: Dict[str, str]) -> Tuple[str, i
         result_parts.append(new_text[last_index:content_start])
         if locid in translations:
             matched += 1
-            new_content = merge_content(new_text[content_start:content_end], translations[locid])
+            safe_translation = escape_translation_text(translations[locid])
+            new_content = merge_content(new_text[content_start:content_end], safe_translation)
         else:
             missing += 1
             new_content = new_text[content_start:content_end]
@@ -160,6 +213,9 @@ def validate_output(new_text: str, merged_text: str) -> List[str]:
 
     errors: List[str] = []
 
+    errors.extend(scan_malformed_comments("New template", new_text))
+    errors.extend(scan_malformed_comments("Merged output", merged_text))
+
     try:
         new_root = ET.fromstring(new_text)
     except ET.ParseError as exc:  # pragma: no cover - defensive
@@ -169,7 +225,16 @@ def validate_output(new_text: str, merged_text: str) -> List[str]:
     try:
         merged_root = ET.fromstring(merged_text)
     except ET.ParseError as exc:
-        errors.append(f"Merged XML is not well-formed: {exc}")
+        line, col = exc.position
+        errors.append(f"Merged XML is not well-formed: {exc} (line {line}, column {col})")
+        error_line_index = line - 1
+        lines = merged_text.splitlines()
+        start = max(0, error_line_index - 2)
+        end = min(len(lines), error_line_index + 3)
+        context_lines = lines[start:end]
+        for offset, ctx_line in enumerate(context_lines, start=start + 1):
+            prefix = ">>" if offset == line else "  "
+            errors.append(f"{prefix} {offset}: {ctx_line}")
         return errors
 
     new_strings = sum(1 for _ in new_root.iter("String"))
@@ -254,16 +319,17 @@ def main(argv: List[str] | None = None) -> int:
     if errors:
         for err in errors:
             logging.error(err)
-        if args.strict:
-            exit_code = 1
+        exit_code = 1
     else:
         logging.info("Validaciones completadas sin errores")
 
-    if not args.dry_run:
+    if not errors and not args.dry_run:
         write_output(out_path, merged_text, new_encoding, new_bom)
         logging.info("Archivo de salida escrito en %s", out_path)
-    else:
+    elif args.dry_run:
         logging.info("Ejecución en modo dry-run: no se escribió archivo de salida")
+    else:
+        logging.error("Se omitió la escritura de salida debido a errores de validación")
 
     total_new_strings = len(list(find_string_elements(new_text)))
     total_old_strings = len(translations)
