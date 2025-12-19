@@ -110,8 +110,12 @@ def parse_string_map(xml_text: str) -> Dict[str, str]:
 
     mapping: Dict[str, str] = {}
     for string_elem in root.iter():
-        if string_elem.tag.endswith("String") and "_locID" in string_elem.attrib:
-            mapping[string_elem.attrib["_locID"]] = string_elem.text or ""
+        if string_elem.tag.endswith("String"):
+            loc_id_attr = next(
+                (key for key in string_elem.attrib.keys() if key.lower() == "_locid"), None
+            )
+            if loc_id_attr:
+                mapping[string_elem.attrib[loc_id_attr]] = string_elem.text or ""
     return mapping
 
 
@@ -236,8 +240,9 @@ def validate_output(template_text: str, output_text: str) -> List[str]:
             return -1
         count = 0
         for elem in root.iter():
-            if elem.tag.endswith("String") and "_locID" in elem.attrib:
-                count += 1
+            if elem.tag.endswith("String"):
+                if any(key.lower() == "_locid" for key in elem.attrib.keys()):
+                    count += 1
         language_elements = [elem for elem in root.iter() if elem.tag.endswith("Language")]
         for lang in language_elements:
             if lang.text and lang.text.strip():
