@@ -133,7 +133,13 @@ def parse_stringtable_mapping(xml_text: str) -> Dict[str, str]:
         if not locid:
             continue
         content = match.group(2)
-        mapping[locid] = content
+        cleaned_content, cleaned = clean_translation_content(locid, content)
+        if cleaned:
+            logging.warning(
+                "Translation for locID %s contained embedded <String> tags; tags were stripped",
+                locid,
+            )
+        mapping[locid] = cleaned_content
 
     return mapping
 
@@ -179,6 +185,38 @@ def escape_translation_text(text: str) -> str:
     )
     text = text.replace("<", "&lt;").replace(">", "&gt;")
     return text
+
+
+def clean_translation_content(locid: str, text: str) -> Tuple[str, bool]:
+    """Remove stray String tags accidentally embedded inside translations.
+
+    Some malformed inputs include serialized `<String>` nodes inside the
+    translation content (for example `&lt;String ...>text</String>`), which
+    later break XML validation when merged. This helper strips both escaped
+    and unescaped `<String>` opening/closing tags while leaving the inner
+    translated text intact.
+    """
+
+    cleaned = False
+    patterns = [
+        r"&lt;String\b[^>]*&gt;",  # escaped opening tag
+        r"&lt;/String&gt;",  # escaped closing tag
+        r"<String\b[^>]*>",  # raw opening tag
+        r"</String>",  # raw closing tag
+        r"&lt;String\b[^>]*/&gt;",  # escaped self-closing
+        r"<String\b[^>]*/>",  # raw self-closing
+    ]
+
+    cleaned_text = text
+    for pattern in patterns:
+        cleaned_text, count = re.subn(pattern, "", cleaned_text, flags=re.IGNORECASE | re.DOTALL)
+        if count:
+            cleaned = True
+
+    if cleaned:
+        cleaned_text = cleaned_text.strip()
+
+    return cleaned_text, cleaned
 
 
 def replace_strings(new_text: str, translations: Dict[str, str]) -> Tuple[str, int, int]:
