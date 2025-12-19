@@ -210,15 +210,20 @@ def rewrite_xml_preserving_layout(
         current_index = parser.CurrentByteIndex
         path = element_stack[-1]["path"]
         chunk = raw_bytes[last_index:current_index]
+        text_bytes = data.encode(replace_encoding)
+
+        # Always copy bytes up to the start of this text node (e.g., the opening tag).
+        out_chunks.append(chunk)
 
         if element_stack[-1]["is_match"] and path in prepared_replacements:
             if not element_stack[-1]["text_replaced"]:
                 out_chunks.append(prepared_replacements[path])
                 element_stack[-1]["text_replaced"] = True
+            # Skip the original text bytes entirely when replacing.
         else:
-            out_chunks.append(chunk)
+            out_chunks.append(text_bytes)
 
-        last_index = current_index
+        last_index = current_index + len(text_bytes)
 
     parser.StartElementHandler = start_element
     parser.EndElementHandler = end_element
