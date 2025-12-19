@@ -86,6 +86,40 @@ def iter_elements_with_paths(root: ET.Element, match_tag: Optional[str]) -> Iter
     yield from walk(root, root_path)
 
 
+def detect_text_outside_target(raw_bytes: bytes, target_local_name: str) -> List[str]:
+    errors: List[str] = []
+    parser = expat.ParserCreate()
+    parser.buffer_text = True
+
+    stack: List[str] = []
+    target_lower = target_local_name.lower()
+
+    def start(name: str, attrs: Dict[str, str]):
+        stack.append(local_name(name))
+
+    def end(name: str):
+        if stack:
+            stack.pop()
+
+    def char_data(data: str):
+        if data and data.strip():
+            inside_target = stack and stack[-1].lower() == target_lower
+            if not inside_target:
+                snippet = data.strip().replace("\n", " ")
+                errors.append(f"Unexpected text outside <{target_local_name}>: {snippet[:80]}")
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = char_data
+
+    try:
+        parser.Parse(raw_bytes, True)
+    except expat.ExpatError as exc:
+        errors.append(f"Failed streaming validation parse: {exc}")
+
+    return errors
+
+
 def build_map_by_key(
     root: ET.Element, match_tag: Optional[str], key_attrs: List[str]
 ) -> TypingTuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
@@ -238,6 +272,55 @@ def rewrite_xml_preserving_layout(
     return b"".join(out_chunks)
 
 
+def validate_output_xml(
+    raw_output: bytes,
+    new_strings: List[TypingTuple[str, ET.Element]],
+    new_map: Dict[str, Dict[str, object]],
+    key_attrs: List[str],
+    match_tag: Optional[str],
+    logger: logging.Logger,
+) -> List[str]:
+    errors: List[str] = []
+
+    try:
+        detected_encoding = detect_encoding_bom(raw_output)
+        decoded = raw_output.decode(encoding_without_bom(detected_encoding))
+        out_root = ET.fromstring(decoded)
+    except (UnicodeDecodeError, ET.ParseError) as exc:
+        return [f"Output XML failed to parse: {exc}"]
+
+    output_strings = list(iter_elements_with_paths(out_root, match_tag))
+    if len(output_strings) != len(new_strings):
+        errors.append(
+            f"Mismatch in <{match_tag or 'String'}> count: new={len(new_strings)} output={len(output_strings)}"
+        )
+
+    output_map, output_duplicates = build_map_by_key(out_root, match_tag, key_attrs)
+    if output_duplicates:
+        logger.warning("Detected %d duplicate key(s) in output XML", len(output_duplicates))
+
+    target_local = match_tag or "String"
+    errors.extend(detect_text_outside_target(raw_output, target_local))
+
+    concatenated: List[str] = []
+    for key, new_entry in new_map.items():
+        if key not in output_map:
+            continue
+        new_text = normalize_text(new_entry["element"].text or "")
+        out_text = normalize_text(output_map[key]["element"].text or "")
+        if not new_text:
+            continue
+        if out_text and out_text != new_text and new_text.lower() in out_text.lower():
+            concatenated.append(key)
+
+    if concatenated:
+        preview = ", ".join(concatenated[:5])
+        more = "" if len(concatenated) <= 5 else f" (and {len(concatenated) - 5} more)"
+        errors.append(f"Detected potential English+Spanish concatenation for key(s): {preview}{more}")
+
+    return errors
+
+
 def main():
     p = argparse.ArgumentParser(
         description=(
@@ -283,7 +366,7 @@ def main():
     logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
     logger = logging.getLogger(__name__)
 
-    key_attrs = args.key_attr or ["symbol", "_locID", "id", "name", "key"]
+    key_attrs = args.key_attr or ["_locID"]
 
     def validate_input_file(path: Path, label: str):
         if not path.exists() or not path.is_file():
@@ -443,6 +526,21 @@ def main():
         decl_pattern = re.compile(r'(<\?xml[^>]*encoding=["\'])([^"\']+)(["\'])', re.IGNORECASE)
         rewritten_text = decl_pattern.sub(rf"\1{out_encoding}\3", rewritten_text, count=1)
         rewritten_bytes = rewritten_text.encode(out_encoding)
+
+    validation_errors = validate_output_xml(
+        rewritten_bytes,
+        new_strings,
+        new_map,
+        key_attrs,
+        args.match_tag,
+        logger,
+    )
+
+    if validation_errors:
+        logger.error("Validation failed; not writing output.")
+        for err in validation_errors:
+            logger.error("- %s", err)
+        sys.exit(1)
 
     try:
         out_path.write_bytes(rewritten_bytes)
