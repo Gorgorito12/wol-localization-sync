@@ -325,23 +325,23 @@ def main():
                 "line_in_old_translation": getattr(info["element"], "sourceline", None)
             })
 
-    # Update elements in-place on NEW_EN tree (keeps structure intact)
+    # Decide translations without mutating the new XML tree; we only patch the raw bytes later
     new_strings = list(iter_elements_with_paths(new_root, args.match_tag))
-    original_text_by_path = {path: elem.text or "" for path, elem in new_strings}
+    replacements: Dict[str, str] = {}
+
     for path_new, e_new in new_strings:
         k = key_for_element(e_new, path_new, key_attrs)
         new_text = e_new.text or ""
 
+        final_text = new_text
         if k in old_tr_map:
-            # Candidate: keep Spanish
+            # Candidate: keep existing translation
             old_tr_text = old_tr_map[k]["element"].text or ""
 
-            # If we have OLD_EN, detect changes in source English text
             if old_en_map and k in old_en_map:
                 old_en_text = old_en_map[k]["element"].text or ""
                 if normalize_text(new_text) != normalize_text(old_en_text):
                     # Source changed -> leave English (flag for re-translation)
-                    e_new.text = new_text
                     changed.append({
                         "key": k,
                         "path": path_new,
@@ -353,14 +353,13 @@ def main():
                     })
                 else:
                     # Source same -> keep translation
-                    e_new.text = old_tr_text
+                    final_text = old_tr_text
             else:
                 # Without old_en we can't reliably detect changed source.
                 # So we keep translation if key exists.
-                e_new.text = old_tr_text
+                final_text = old_tr_text
         else:
             # New key -> leave English
-            e_new.text = new_text
             added.append({
                 "key": k,
                 "path": path_new,
@@ -368,11 +367,8 @@ def main():
                 "new_en": new_text
             })
 
-    replacements: Dict[str, str] = {}
-    for path, elem in new_strings:
-        final_text = elem.text or ""
-        if final_text != original_text_by_path.get(path, ""):
-            replacements[path] = final_text
+        if final_text != new_text:
+            replacements[path_new] = final_text
 
     report = {
         "summary": {
