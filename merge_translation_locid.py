@@ -170,14 +170,19 @@ def detect_comment_balance(text: str) -> Tuple[List[int], List[int]]:
 def _suggest_comment_close_position(text: str, start_index: int) -> int:
     """
     Suggest an insertion position for closing a comment that starts at start_index.
-    Prefer to close immediately after the closing </String> on the same line,
-    otherwise at the end of that line, or at the end of the document.
+    Prefer to close before the closing </String> on the same line to avoid
+    swallowing the element end tag, otherwise at the end of that line, or at
+    the end of the document.
     """
     line_end = text.find("\n", start_index)
     search_limit = line_end if line_end != -1 else len(text)
-    string_close = text.find("</String>", start_index, search_limit)
-    if string_close != -1:
-        return string_close + len("</String>")
+
+    string_close_match = re.search(
+        r"</(?:[A-Za-z_][\w\.\-]*:)?String\s*>", text[start_index:search_limit], re.IGNORECASE
+    )
+    if string_close_match:
+        return start_index + string_close_match.start()
+
     return search_limit
 
 
