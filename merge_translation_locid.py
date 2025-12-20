@@ -144,6 +144,77 @@ def collect_template_strings(template: str) -> List[TemplateString]:
     return strings
 
 
+def detect_comment_balance(text: str) -> Tuple[List[int], List[int]]:
+    """
+    Returns a tuple of (unclosed_comment_starts, unmatched_comment_closes).
+    Positions are character offsets within the provided text.
+    """
+    unclosed_starts: List[int] = []
+    unmatched_closes: List[int] = []
+    stack: List[int] = []
+
+    for match in re.finditer(r"<!--|-->", text):
+        token = match.group(0)
+        if token == "<!--":
+            stack.append(match.start())
+        else:
+            if stack:
+                stack.pop()
+            else:
+                unmatched_closes.append(match.start())
+
+    unclosed_starts.extend(stack)
+    return unclosed_starts, unmatched_closes
+
+
+def _suggest_comment_close_position(text: str, start_index: int) -> int:
+    """
+    Suggest an insertion position for closing a comment that starts at start_index.
+    Prefer to close immediately after the closing </String> on the same line,
+    otherwise at the end of that line, or at the end of the document.
+    """
+    line_end = text.find("\n", start_index)
+    search_limit = line_end if line_end != -1 else len(text)
+    string_close = text.find("</String>", start_index, search_limit)
+    if string_close != -1:
+        return string_close + len("</String>")
+    return search_limit
+
+
+def ensure_closed_comments(text: str) -> Tuple[str, List[str], int]:
+    """
+    Detect and optionally repair unclosed XML comments.
+    Returns (fixed_text, errors, auto_closed_count).
+    Any remaining errors indicate the output is not safe to write.
+    """
+    errors: List[str] = []
+    unclosed_starts, unmatched_closes = detect_comment_balance(text)
+
+    if unmatched_closes:
+        errors.append(
+            f"Found {len(unmatched_closes)} unmatched comment closing token(s) (-->)."
+        )
+
+    fixed_text = text
+    auto_closed = 0
+    if unclosed_starts:
+        auto_closed = len(unclosed_starts)
+        insertion_points = [
+            _suggest_comment_close_position(fixed_text, pos) for pos in unclosed_starts
+        ]
+        for insert_at in sorted(insertion_points, reverse=True):
+            fixed_text = f"{fixed_text[:insert_at]} -->{fixed_text[insert_at:]}"
+
+    # Re-validate after auto-closing.
+    remaining_unclosed, remaining_unmatched = detect_comment_balance(fixed_text)
+    if remaining_unclosed or remaining_unmatched:
+        errors.append(
+            "XML comments remain unbalanced after auto-fix; output would be malformed."
+        )
+
+    return fixed_text, errors, auto_closed
+
+
 def merge_translations(
     template_text: str,
     new_en_map: Dict[str, str],
@@ -329,17 +400,30 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         mode=args.mode,
     )
 
-    if args.strict:
-        validation_errors = validate_output(template_text, merge_result.output_text)
-        if validation_errors:
-            for err in validation_errors:
-                print(f"[validation-error] {err}", file=sys.stderr)
-            return 1
+    output_text, comment_errors, auto_closed = ensure_closed_comments(
+        merge_result.output_text
+    )
+    merge_result.output_text = output_text
+    merge_result.report["auto_closed_comments"] = auto_closed
+    if comment_errors:
+        merge_result.report["comment_validation_errors"] = comment_errors
+
+    validation_errors = validate_output(template_text, output_text)
+    has_parse_errors = any(err.startswith("Output XML is invalid") for err in validation_errors)
+
+    all_errors = comment_errors + validation_errors
+    should_fail = bool(comment_errors or has_parse_errors or (args.strict and validation_errors))
+
+    if all_errors:
+        for err in all_errors:
+            print(f"[validation-error] {err}", file=sys.stderr)
+    if should_fail:
+        return 1
 
     if args.dry_run:
         print("[dry-run] Merge completed. Output not written.")
     else:
-        write_text_with_bom(out_path, merge_result.output_text, encoding, has_bom)
+        write_text_with_bom(out_path, output_text, encoding, has_bom)
         report_path.write_text(json.dumps(merge_result.report, indent=2), encoding="utf-8")
 
     print(json.dumps(merge_result.report, indent=2))
