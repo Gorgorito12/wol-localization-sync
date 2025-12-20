@@ -372,7 +372,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     report_path = Path(args.report)
     old_en_path = Path(args.old_en) if args.old_en else None
 
-    template_text, has_bom, read_encoding = read_text_with_bom(new_path)
+    try:
+        template_text, has_bom, read_encoding = read_text_with_bom(new_path)
+    except FileNotFoundError as exc:
+        print(f"[error] Failed to load new English XML: {exc}", file=sys.stderr)
+        return 1
     encoding = detect_encoding(template_text, default=read_encoding)
 
     try:
