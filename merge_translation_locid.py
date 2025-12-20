@@ -254,22 +254,18 @@ def _suggest_comment_close_position(text: str, start_index: int) -> int:
     return search_limit
 
 
-def ensure_closed_comments(text: str) -> Tuple[str, List[str], int]:
+def ensure_closed_comments(text: str) -> Tuple[str, List[str], int, int]:
     """
     Detect and optionally repair unclosed XML comments.
-    Returns (fixed_text, errors, auto_closed_count).
+    Returns (fixed_text, errors, auto_closed_count, removed_unmatched_closings).
     Any remaining errors indicate the output is not safe to write.
     """
     errors: List[str] = []
     unclosed_starts, unmatched_closes = detect_comment_balance(text)
 
-    if unmatched_closes:
-        errors.append(
-            f"Found {len(unmatched_closes)} unmatched comment closing token(s) (-->)."
-        )
-
     fixed_text = text
     auto_closed = 0
+    removed_unmatched = 0
     if unclosed_starts:
         auto_closed = len(unclosed_starts)
         insertion_points = [
@@ -278,6 +274,11 @@ def ensure_closed_comments(text: str) -> Tuple[str, List[str], int]:
         for insert_at in sorted(insertion_points, reverse=True):
             fixed_text = f"{fixed_text[:insert_at]} -->{fixed_text[insert_at:]}"
 
+    if unmatched_closes:
+        removed_unmatched = len(unmatched_closes)
+        for close_pos in sorted(unmatched_closes, reverse=True):
+            fixed_text = f"{fixed_text[:close_pos]}{fixed_text[close_pos + 3:]}"
+
     # Re-validate after auto-closing.
     remaining_unclosed, remaining_unmatched = detect_comment_balance(fixed_text)
     if remaining_unclosed or remaining_unmatched:
@@ -285,7 +286,29 @@ def ensure_closed_comments(text: str) -> Tuple[str, List[str], int]:
             "XML comments remain unbalanced after auto-fix; output would be malformed."
         )
 
-    return fixed_text, errors, auto_closed
+    return fixed_text, errors, auto_closed, removed_unmatched
+
+
+def _normalize_output_tree(xml_text: str, encoding: str) -> Tuple[str, int, List[str]]:
+    """
+    Parse the provided XML text, strip stray text/tail nodes within Language
+    elements, and return the normalized XML along with counts and errors.
+    """
+    parser = _build_parser_with_comments()
+    try:
+        root = ET.fromstring(xml_text.lstrip("\ufeff"), parser=parser)
+    except ET.ParseError as exc:
+        return xml_text, 0, [f"Failed to parse cleaned XML for normalization: {exc}"]
+
+    removed_nodes = _strip_language_text_nodes(root)
+    declaration_present = xml_text.lstrip().startswith("<?xml")
+    normalized_bytes = ET.tostring(
+        root,
+        encoding=encoding,
+        xml_declaration=declaration_present,
+        short_empty_elements=False,
+    )
+    return normalized_bytes.decode(encoding), removed_nodes, []
 
 
 def merge_translations(
@@ -493,11 +516,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         output_encoding=encoding,
     )
 
-    output_text, comment_errors, auto_closed = ensure_closed_comments(
+    output_text, comment_errors, auto_closed, removed_unmatched = ensure_closed_comments(
         merge_result.output_text
     )
     merge_result.output_text = output_text
     merge_result.report["auto_closed_comments"] = auto_closed
+    if removed_unmatched:
+        merge_result.report["removed_unmatched_comment_closings"] = removed_unmatched
     if comment_errors:
         merge_result.report["comment_validation_errors"] = comment_errors
 
@@ -509,11 +534,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         merge_result.report["removed_language_tail_segments"] = removed_count
         merge_result.report["removed_language_tail_snippets"] = removed_snippets
 
+    normalized_output, stripped_nodes, normalization_errors = _normalize_output_tree(
+        merge_result.output_text, encoding
+    )
+    merge_result.output_text = normalized_output
+    if stripped_nodes:
+        merge_result.report["removed_language_text_nodes_after_normalize"] = stripped_nodes
+    if normalization_errors:
+        merge_result.report["normalization_errors"] = normalization_errors
+
     validation_errors = validate_output(template_text, merge_result.output_text)
     has_parse_errors = any(err.startswith("Output XML is invalid") for err in validation_errors)
 
-    all_errors = comment_errors + validation_errors
-    should_fail = bool(comment_errors or has_parse_errors or (args.strict and validation_errors))
+    all_errors = comment_errors + normalization_errors + validation_errors
+    should_fail = bool(
+        comment_errors or normalization_errors or has_parse_errors or (args.strict and validation_errors)
+    )
 
     if all_errors:
         for err in all_errors:
