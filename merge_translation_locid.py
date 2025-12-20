@@ -10,6 +10,7 @@ Optional:
     --mode "safe"|"force" (default: safe)
     --dry-run
     --strict
+    --debug
 """
 from __future__ import annotations
 
@@ -52,6 +53,34 @@ LANGUAGE_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def escape_xml_text(text: str) -> str:
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def strip_illegal_xml_chars(s: str) -> str:
+    return "".join(
+        ch for ch in s if ch == "\t" or ch == "\n" or ch == "\r" or ord(ch) >= 0x20
+    )
+
+
+def debug_locid_context(xml_text: str, line: int, col: int) -> tuple[Optional[str], str]:
+    lines = xml_text.splitlines()
+    idx_line = max(1, line) - 1
+    if idx_line >= len(lines):
+        idx_line = len(lines) - 1
+    pos = sum(len(l) + 1 for l in lines[:idx_line]) + max(0, col - 1)
+    start = max(0, pos - 200)
+    end = min(len(xml_text), pos + 200)
+    context = xml_text[start:end]
+    back = xml_text[max(0, pos - 5000) : pos]
+    m = list(re.finditer(r'_locID\s*=\s*["\']([^"\']+)["\']', back, flags=re.IGNORECASE))
+    locid = m[-1].group(1) if m else None
+    return locid, context
 
 
 def extract_template_strings(text: str, *, base_offset: int = 0) -> List[TemplateString]:
@@ -289,7 +318,9 @@ def ensure_closed_comments(text: str) -> Tuple[str, List[str], int, int]:
     return fixed_text, errors, auto_closed, removed_unmatched
 
 
-def _normalize_output_tree(xml_text: str, encoding: str) -> Tuple[str, int, List[str]]:
+def _normalize_output_tree(
+    xml_text: str, encoding: str, *, debug: bool = False
+) -> Tuple[str, int, List[str]]:
     """
     Parse the provided XML text, strip stray text/tail nodes within Language
     elements, and return the normalized XML along with counts and errors.
@@ -298,7 +329,18 @@ def _normalize_output_tree(xml_text: str, encoding: str) -> Tuple[str, int, List
     try:
         root = ET.fromstring(xml_text.lstrip("\ufeff"), parser=parser)
     except ET.ParseError as exc:
-        return xml_text, 0, [f"Failed to parse cleaned XML for normalization: {exc}"]
+        error_msg = f"Failed to parse cleaned XML for normalization: {exc}"
+        if debug:
+            line, col = exc.position
+            locid, context = debug_locid_context(xml_text, line, col)
+            locid_msg = f"_locID={locid}" if locid else "no _locID found nearby"
+            context_display = context.replace("\n", "\\n").replace("\r", "\\r")
+            print(
+                f"[debug] ParseError ({exc}) at line {line} col {col}, near {locid_msg}.",
+                file=sys.stderr,
+            )
+            print(f"[debug] Context: {context_display}", file=sys.stderr)
+        return xml_text, 0, [error_msg]
 
     removed_nodes = _strip_language_text_nodes(root)
     declaration_present = xml_text.lstrip().startswith("<?xml")
@@ -373,7 +415,8 @@ def merge_translations(
 
             for child in list(elem):
                 elem.remove(child)
-            elem.text = old_translation_text
+            clean = strip_illegal_xml_chars(old_translation_text)
+            elem.text = escape_xml_text(clean)
         else:
             new_untranslated += 1
             new_untranslated_ids.append(loc_id)
@@ -410,14 +453,24 @@ def merge_translations(
     return MergeResult(output_text=merged_bytes.decode(output_encoding), report=report)
 
 
-def validate_output(template_text: str, output_text: str) -> List[str]:
+def validate_output(template_text: str, output_text: str, *, debug: bool = False) -> List[str]:
     errors: List[str] = []
 
-    def count_strings(text: str) -> int:
+    def count_strings(text: str, label: str) -> int:
         try:
             root = ET.fromstring(text.lstrip("\ufeff"))
         except ET.ParseError as exc:
             errors.append(f"Output XML is invalid: {exc}")
+            if debug:
+                line, col = exc.position
+                locid, context = debug_locid_context(text, line, col)
+                locid_msg = f"_locID={locid}" if locid else "no _locID found nearby"
+                context_display = context.replace("\n", "\\n").replace("\r", "\\r")
+                print(
+                    f"[debug] ParseError ({exc}) while parsing {label} at line {line} col {col}, near {locid_msg}.",
+                    file=sys.stderr,
+                )
+                print(f"[debug] Context: {context_display}", file=sys.stderr)
             return -1
         count = 0
         for elem in root.iter():
@@ -433,8 +486,8 @@ def validate_output(template_text: str, output_text: str) -> List[str]:
                     errors.append("Found stray tail text inside <Language> element.")
         return count
 
-    new_count = count_strings(template_text)
-    out_count = count_strings(output_text)
+    new_count = count_strings(template_text, "template")
+    out_count = count_strings(output_text, "output")
     if new_count != -1 and out_count != -1 and new_count != out_count:
         errors.append(
             f"String count mismatch: new template has {new_count}, output has {out_count}."
@@ -465,6 +518,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--strict",
         action="store_true",
         help="Enable validations (XML parse, string counts, stray text) and fail on errors.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output when parsing fails (locID and nearby context).",
     )
     return parser.parse_args(argv)
 
@@ -535,7 +593,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         merge_result.report["removed_language_tail_snippets"] = removed_snippets
 
     normalized_output, stripped_nodes, normalization_errors = _normalize_output_tree(
-        merge_result.output_text, encoding
+        merge_result.output_text, encoding, debug=args.debug
     )
     merge_result.output_text = normalized_output
     if stripped_nodes:
@@ -543,7 +601,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if normalization_errors:
         merge_result.report["normalization_errors"] = normalization_errors
 
-    validation_errors = validate_output(template_text, merge_result.output_text)
+    validation_errors = validate_output(template_text, merge_result.output_text, debug=args.debug)
     has_parse_errors = any(err.startswith("Output XML is invalid") for err in validation_errors)
 
     all_errors = comment_errors + normalization_errors + validation_errors
@@ -560,7 +618,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.dry_run:
         print("[dry-run] Merge completed. Output not written.")
     else:
-        write_text_with_bom(out_path, output_text, encoding, has_bom)
+        write_text_with_bom(out_path, merge_result.output_text, encoding, has_bom)
         report_path.write_text(json.dumps(merge_result.report, indent=2), encoding="utf-8")
 
     print(json.dumps(merge_result.report, indent=2))
