@@ -29,6 +29,87 @@ class MergeResult:
     report: dict
 
 
+STRING_PATTERN = re.compile(
+    r'<(?P<prefix>[A-Za-z_][\w\.\-]*:)?String\b[^>]*\s_locID\s*=\s*(?P<quote>["\'])'
+    r'(?P<loc_id>[^"\']+)(?P=quote)[^>]*>'
+    r'(?P<inner>.*?)</(?P=prefix)?String>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+@dataclass
+class TemplateString:
+    loc_id: str
+    inner_text: str
+    start: int
+    end: int
+    inner_start: int
+    inner_end: int
+
+
+LANGUAGE_PATTERN = re.compile(
+    r'<(?P<prefix>[A-Za-z_][\w\.\-]*:)?Language\b[^>]*>(?P<body>.*?)</(?P=prefix)?Language>',
+    re.DOTALL | re.IGNORECASE,
+)
+COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def extract_template_strings(text: str, *, base_offset: int = 0) -> List[TemplateString]:
+    strings: List[TemplateString] = []
+    for match in STRING_PATTERN.finditer(text):
+        strings.append(
+            TemplateString(
+                loc_id=match.group("loc_id"),
+                inner_text=match.group("inner"),
+                start=match.start() + base_offset,
+                end=match.end() + base_offset,
+                inner_start=match.start("inner") + base_offset,
+                inner_end=match.end("inner") + base_offset,
+            )
+        )
+    return strings
+
+
+def _strip_language_tail_text_segments(xml_text: str) -> Tuple[str, List[str], int]:
+    """
+    Remove any non-whitespace, non-comment text that appears directly inside
+    <Language> elements but outside <String> nodes. Returns the cleaned text,
+    a list of removed snippets for reporting, and the count of removals.
+    """
+    removals: List[Tuple[int, int]] = []
+    removed_snippets: List[str] = []
+
+    for lang_match in LANGUAGE_PATTERN.finditer(xml_text):
+        body_start = lang_match.start("body")
+        body_end = lang_match.end("body")
+        body_text = xml_text[body_start:body_end]
+
+        string_nodes = extract_template_strings(body_text, base_offset=body_start)
+        prev_end = body_start
+
+        def mark_segment(segment_start: int, segment_end: int) -> None:
+            segment = xml_text[segment_start:segment_end]
+            without_comments = COMMENT_PATTERN.sub("", segment)
+            if without_comments.strip():
+                removals.append((segment_start, segment_end))
+                preview = without_comments.strip().replace("\n", " ")
+                removed_snippets.append(preview[:120])
+
+        for string_node in string_nodes:
+            if string_node.start > prev_end:
+                mark_segment(prev_end, string_node.start)
+            prev_end = string_node.end
+
+        if body_end > prev_end:
+            mark_segment(prev_end, body_end)
+
+    cleaned_text = xml_text
+    for start, end in sorted(removals, reverse=True):
+        cleaned_text = f"{cleaned_text[:start]}{cleaned_text[end:]}"
+
+    return cleaned_text, removed_snippets, len(removals)
+
+
 def detect_encoding(text: str, default: str = "utf-8") -> str:
     declaration = re.search(r'<\?xml[^>]*encoding=["\']([^"\']+)["\']', text, re.IGNORECASE)
     if declaration:
@@ -420,7 +501,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if comment_errors:
         merge_result.report["comment_validation_errors"] = comment_errors
 
-    validation_errors = validate_output(template_text, output_text)
+    cleaned_output, removed_snippets, removed_count = _strip_language_tail_text_segments(
+        merge_result.output_text
+    )
+    merge_result.output_text = cleaned_output
+    if removed_count:
+        merge_result.report["removed_language_tail_segments"] = removed_count
+        merge_result.report["removed_language_tail_snippets"] = removed_snippets
+
+    validation_errors = validate_output(template_text, merge_result.output_text)
     has_parse_errors = any(err.startswith("Output XML is invalid") for err in validation_errors)
 
     all_errors = comment_errors + validation_errors
