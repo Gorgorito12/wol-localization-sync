@@ -180,25 +180,24 @@ def merge_translations(
             old_translation_text = old_trans_map[ts.loc_id]
             escaped_translation = escape_xml_text(old_translation_text)
 
+            replacement_text = escaped_translation
+
             if mode == "force":
-                replacement_text = escaped_translation
                 forced_applied += 1
                 forced_applied_ids.append(ts.loc_id)
-            else:
-                if old_en_map and ts.loc_id in old_en_map:
-                    old_en_text = old_en_map[ts.loc_id]
-                    new_en_text = new_en_map.get(ts.loc_id, ts.inner_text)
-                    if new_en_text == old_en_text:
-                        replacement_text = escaped_translation
-                        safe_applied_translation += 1
-                        safe_applied_ids.append(ts.loc_id)
-                    else:
-                        needs_retranslate += 1
-                        needs_retranslate_ids.append(ts.loc_id)
+
+            if old_en_map and ts.loc_id in old_en_map:
+                old_en_text = old_en_map[ts.loc_id]
+                new_en_text = new_en_map.get(ts.loc_id, ts.inner_text)
+                if new_en_text == old_en_text:
+                    safe_applied_translation += 1
+                    safe_applied_ids.append(ts.loc_id)
                 else:
-                    replacement_text = escaped_translation
-                    unknown_change += 1
-                    unknown_change_ids.append(ts.loc_id)
+                    needs_retranslate += 1
+                    needs_retranslate_ids.append(ts.loc_id)
+            else:
+                unknown_change += 1
+                unknown_change_ids.append(ts.loc_id)
         else:
             new_untranslated += 1
             new_untranslated_ids.append(ts.loc_id)
