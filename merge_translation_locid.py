@@ -23,24 +23,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 
-STRING_PATTERN = re.compile(
-    r'<(?P<prefix>[A-Za-z_][\w\.\-]*:)?String\b[^>]*\s_locID\s*=\s*(?P<quote>["\'])'
-    r'(?P<loc_id>[^"\']+)(?P=quote)[^>]*>'
-    r'(?P<inner>.*?)</(?P=prefix)?String>',
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-@dataclass
-class TemplateString:
-    loc_id: str
-    inner_text: str
-    start: int
-    end: int
-    inner_start: int
-    inner_end: int
-
-
 @dataclass
 class MergeResult:
     output_text: str
@@ -110,7 +92,7 @@ def parse_string_map(xml_text: str) -> Dict[str, str]:
 
     mapping: Dict[str, str] = {}
     for string_elem in root.iter():
-        if string_elem.tag.endswith("String"):
+        if isinstance(string_elem.tag, str) and string_elem.tag.endswith("String"):
             loc_id_attr = next(
                 (key for key in string_elem.attrib.keys() if key.lower() == "_locid"), None
             )
@@ -119,29 +101,34 @@ def parse_string_map(xml_text: str) -> Dict[str, str]:
     return mapping
 
 
-def escape_xml_text(text: str) -> str:
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-    return text
+def _build_parser_with_comments() -> ET.XMLParser:
+    return ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
 
 
-def collect_template_strings(template: str) -> List[TemplateString]:
-    strings: List[TemplateString] = []
-    for match in STRING_PATTERN.finditer(template):
-        loc_id = match.group("loc_id")
-        inner_text = match.group("inner")
-        strings.append(
-            TemplateString(
-                loc_id=loc_id,
-                inner_text=inner_text,
-                start=match.start(),
-                end=match.end(),
-                inner_start=match.start("inner"),
-                inner_end=match.end("inner"),
-            )
-        )
-    return strings
+def _loc_id_attr(elem: ET.Element) -> Tuple[Optional[str], Optional[str]]:
+    for key in elem.attrib.keys():
+        if key.lower() == "_locid":
+            return key, elem.attrib[key]
+    return None, None
+
+
+def _strip_language_text_nodes(root: ET.Element) -> int:
+    """
+    Remove non-whitespace text or tail nodes that live directly inside <Language> elements.
+    Returns the number of modified nodes.
+    """
+    removed = 0
+    for lang in root.iter():
+        if not isinstance(lang.tag, str) or not lang.tag.endswith("Language"):
+            continue
+        if lang.text and lang.text.strip():
+            lang.text = None
+            removed += 1
+        for child in lang:
+            if child.tail and child.tail.strip():
+                child.tail = None
+                removed += 1
+    return removed
 
 
 def detect_comment_balance(text: str) -> Tuple[List[int], List[int]]:
@@ -226,16 +213,17 @@ def merge_translations(
     old_trans_map: Dict[str, str],
     old_en_map: Optional[Dict[str, str]],
     mode: str,
+    output_encoding: str,
 ) -> MergeResult:
-    template_strings = collect_template_strings(template_text)
+    parser = _build_parser_with_comments()
+    try:
+        root = ET.fromstring(template_text.lstrip("\ufeff"), parser=parser)
+    except ET.ParseError as exc:
+        raise ValueError(f"Failed to parse template XML: {exc}") from exc
 
-    total_new_strings = len(template_strings)
+    total_new_strings = 0
     total_old_translated_strings = len(old_trans_map)
-    orphan_old_trans = sorted(set(old_trans_map) - {ts.loc_id for ts in template_strings})
-
-    output_parts: List[str] = []
-    last_index = 0
-
+    template_loc_ids: set[str] = set()
     safe_applied_translation = 0
     new_untranslated = 0
     needs_retranslate = 0
@@ -248,41 +236,54 @@ def merge_translations(
     forced_applied_ids: List[str] = []
     safe_applied_ids: List[str] = []
 
-    for ts in template_strings:
-        output_parts.append(template_text[last_index : ts.inner_start])
+    for elem in root.iter():
+        if not isinstance(elem.tag, str) or not elem.tag.endswith("String"):
+            continue
 
-        replacement_text = ts.inner_text
-        if ts.loc_id in old_trans_map:
-            old_translation_text = old_trans_map[ts.loc_id]
-            escaped_translation = escape_xml_text(old_translation_text)
+        attr_key, loc_id = _loc_id_attr(elem)
+        if not attr_key or not loc_id:
+            continue
 
-            replacement_text = escaped_translation
+        template_loc_ids.add(loc_id)
+        total_new_strings += 1
+
+        if loc_id in old_trans_map:
+            old_translation_text = old_trans_map[loc_id]
 
             if mode == "force":
                 forced_applied += 1
-                forced_applied_ids.append(ts.loc_id)
+                forced_applied_ids.append(loc_id)
 
-            if old_en_map and ts.loc_id in old_en_map:
-                old_en_text = old_en_map[ts.loc_id]
-                new_en_text = new_en_map.get(ts.loc_id, ts.inner_text)
+            if old_en_map and loc_id in old_en_map:
+                old_en_text = old_en_map[loc_id]
+                new_en_text = new_en_map.get(loc_id, elem.text or "")
                 if new_en_text == old_en_text:
                     safe_applied_translation += 1
-                    safe_applied_ids.append(ts.loc_id)
+                    safe_applied_ids.append(loc_id)
                 else:
                     needs_retranslate += 1
-                    needs_retranslate_ids.append(ts.loc_id)
+                    needs_retranslate_ids.append(loc_id)
             else:
                 unknown_change += 1
-                unknown_change_ids.append(ts.loc_id)
+                unknown_change_ids.append(loc_id)
+
+            for child in list(elem):
+                elem.remove(child)
+            elem.text = old_translation_text
         else:
             new_untranslated += 1
-            new_untranslated_ids.append(ts.loc_id)
+            new_untranslated_ids.append(loc_id)
 
-        output_parts.append(replacement_text)
-        last_index = ts.inner_end
+    removed_language_text_nodes = _strip_language_text_nodes(root)
+    orphan_old_trans = sorted(set(old_trans_map) - template_loc_ids)
 
-    output_parts.append(template_text[last_index:])
-    merged_text = "".join(output_parts)
+    xml_declaration_present = template_text.lstrip().startswith("<?xml")
+    merged_bytes = ET.tostring(
+        root,
+        encoding=output_encoding,
+        xml_declaration=xml_declaration_present,
+        short_empty_elements=False,
+    )
 
     report = {
         "mode": mode,
@@ -299,9 +300,10 @@ def merge_translations(
         "unknown_change_ids": unknown_change_ids,
         "forced_applied_ids": forced_applied_ids,
         "safe_applied_ids": safe_applied_ids,
+        "removed_language_text_nodes": removed_language_text_nodes,
     }
 
-    return MergeResult(output_text=merged_text, report=report)
+    return MergeResult(output_text=merged_bytes.decode(output_encoding), report=report)
 
 
 def validate_output(template_text: str, output_text: str) -> List[str]:
@@ -407,6 +409,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         old_trans_map=old_trans_map,
         old_en_map=old_en_map,
         mode=args.mode,
+        output_encoding=encoding,
     )
 
     output_text, comment_errors, auto_closed = ensure_closed_comments(
